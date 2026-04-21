@@ -32,6 +32,7 @@ import {
   upsertJob,
   writeJobFile
 } from "./lib/state.mjs";
+import { resolveSessionInbox, writeCompletionMarker } from "./lib/notify.mjs";
 import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
@@ -803,14 +804,69 @@ async function handleTaskWorker(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
+  const jobId = options["job-id"];
+
+  // Safety net: if runTrackedJob doesn't write a completion marker (pre-run
+  // throws, uncaught exception, SIGTERM/SIGINT), ensure a `failed` marker
+  // lands in the session inbox so Claude's PostToolUse hook can still ping.
+  // SIGKILL / OOM cannot be caught — accepted limit.
+  const safetyCtx = {
+    sessionId: null,
+    jobId,
+    workspaceRoot,
+    kind: null,
+    title: null
+  };
+  const writeSafetyMarker = (reason) => {
+    if (!safetyCtx.sessionId) return;
+    try {
+      const inboxDir = resolveSessionInbox(safetyCtx.sessionId);
+      if (!inboxDir) return;
+      const markerPath = path.join(inboxDir, `${safetyCtx.jobId}.json`);
+      if (fs.existsSync(markerPath)) return;
+      writeCompletionMarker(safetyCtx.sessionId, {
+        jobId: safetyCtx.jobId,
+        status: "failed",
+        kind: safetyCtx.kind,
+        title: safetyCtx.title,
+        errorMessage: `Task worker exited without finalizing: ${reason}`,
+        workspaceRoot: safetyCtx.workspaceRoot,
+        completedAt: new Date().toISOString()
+      });
+    } catch {
+      // Best-effort: never throw from an exit/signal handler.
+    }
+  };
+  process.on("exit", () => writeSafetyMarker("process exit"));
+  process.on("SIGTERM", () => {
+    writeSafetyMarker("SIGTERM");
+    process.exit(143);
+  });
+  process.on("SIGINT", () => {
+    writeSafetyMarker("SIGINT");
+    process.exit(130);
+  });
+  process.on("uncaughtException", (err) => {
+    writeSafetyMarker(`uncaughtException: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  });
+  process.on("unhandledRejection", (reason) => {
+    const message = reason instanceof Error ? reason.message : String(reason);
+    writeSafetyMarker(`unhandledRejection: ${message}`);
+    process.exit(1);
+  });
+
+  const storedJob = readStoredJob(workspaceRoot, jobId);
   if (!storedJob) {
-    throw new Error(`No stored job found for ${options["job-id"]}.`);
+    throw new Error(`No stored job found for ${jobId}.`);
   }
+  safetyCtx.sessionId = storedJob.sessionId ?? null;
+  safetyCtx.kind = storedJob.kind ?? null;
+  safetyCtx.title = storedJob.title ?? null;
 
   const request = storedJob.request;
   if (!request || typeof request !== "object") {
-    throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
+    throw new Error(`Stored job ${jobId} is missing its task request payload.`);
   }
 
   const { logFile, progress } = createTrackedProgress(
@@ -966,6 +1022,19 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user.",
     completedAt
   });
+
+  const markerSessionId = existing.sessionId ?? job.sessionId ?? null;
+  if (markerSessionId) {
+    writeCompletionMarker(markerSessionId, {
+      jobId: job.id,
+      status: "cancelled",
+      kind: existing.kind ?? job.kind ?? null,
+      title: existing.title ?? job.title ?? null,
+      errorMessage: "Cancelled by user.",
+      workspaceRoot,
+      completedAt
+    });
+  }
 
   const payload = {
     jobId: job.id,

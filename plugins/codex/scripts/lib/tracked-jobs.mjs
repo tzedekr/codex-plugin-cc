@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
+import { writeCompletionMarker } from "./notify.mjs";
 import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
@@ -177,6 +178,17 @@ export async function runTrackedJob(job, runner, options = {}) {
       completedAt
     });
     appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
+    if (job.sessionId) {
+      writeCompletionMarker(job.sessionId, {
+        jobId: job.id,
+        status: completionStatus,
+        kind: job.kind ?? null,
+        title: job.title ?? null,
+        summary: execution.summary ?? null,
+        workspaceRoot: job.workspaceRoot,
+        completedAt
+      });
+    }
     return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -199,6 +211,17 @@ export async function runTrackedJob(job, runner, options = {}) {
       errorMessage,
       completedAt
     });
+    if (job.sessionId) {
+      writeCompletionMarker(job.sessionId, {
+        jobId: job.id,
+        status: "failed",
+        kind: job.kind ?? null,
+        title: job.title ?? null,
+        errorMessage,
+        workspaceRoot: job.workspaceRoot,
+        completedAt
+      });
+    }
     throw error;
   }
 }
